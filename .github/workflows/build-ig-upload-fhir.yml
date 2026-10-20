@@ -75,16 +75,26 @@ jobs:
         id: install_uploadfig
         if: env.FHIR_SERVER_URL != ''
         run: dotnet tool install -g UploadFIG
-      - name: Preload root resources and examples with Ember (preserve IDs)
-        id: ember
+      - name: Upload IG package (profiles, extensions, terminology and examples)
+        id: uploadfig
         if: env.FHIR_SERVER_URL != ''
         env:
+          # Keep the token out of build/setup steps. Never enable shell tracing.
           FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p workflow-logs
-          python3 - <<'EMBER_PYTHON'
-          import json, os, re, subprocess, sys, tarfile, tempfile, urllib.error, urllib.request
+          args=(-s output/package.tgz -d "$FHIR_SERVER_URL" -df json -r '*')
+          if [ -n "$FHIR_SERVER_TOKEN" ]; then
+            args+=(-dh "Authorization: Bearer $FHIR_SERVER_TOKEN")
+          fi
+          # Earlier attempts must not mark the job failed if a later one succeeds.
+          for attempt in 1 2 3; do
+            # Run the example transaction only after the first two passes failed.
+            if [ "$attempt" -eq 3 ]; then
+              echo "Running Ember fallback before UploadFIG attempt 3."
+              if python3 - <<'EMBER_PYTHON'
+          import json, os, re, subprocess, urllib.error, urllib.request
           from pathlib import Path
           
           folder = Path('workflow-logs')
@@ -105,29 +115,12 @@ jobs:
                   return None
           
           try:
-              # Pin source: release 0.3.0 lacks includeRoot/usePUT support.
-              # Build the inspected revision so root resources AND examples are included.
-              revision = 'ac07aecf7cf6bf4cff0da365a296901019e66547'
-              image = 'ig-ember:' + revision
-              with tempfile.TemporaryDirectory() as temporary:
-                  archive = Path(temporary) / 'ember.tar.gz'
-                  url = 'https://codeload.github.com/jkiddo/ember/tar.gz/' + revision
-                  with urllib.request.urlopen(url, timeout=60) as response:
-                      archive.write_bytes(response.read())
-                  with tarfile.open(archive) as source:
-                      source.extractall(temporary, filter='data')
-                  context = Path(temporary) / ('ember-' + revision)
-                  built = subprocess.run(['docker', 'build', '-t', image, str(context)],
-                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, timeout=900)
-                  record(built.stdout)
-                  if built.returncode:
-                      raise RuntimeError('Could not build the pinned Ember image')
-              # Without serverBase Ember only generates a bundle. Authentication is handled below.
+              # Ember 0.3.0 reads package/example; it does not recursively load dependencies.
+              # Without serverBase it only generates a bundle and never contacts our FHIR server.
               package = Path('output/package.tgz').resolve()
-              command = ['docker', 'run', '--rm', '--name', 'ig-ember-preload',
+              command = ['docker', 'run', '--rm', '--name', 'ig-ember-fallback',
                          '--mount', f'type=bind,src={package},dst=/input/package.tgz,readonly',
-                         image, '--location=file:/input/package.tgz', '--includeRoot=true', '--usePUT=true',
+                         'jkiddo/ember:0.3.0', '--location=file:/input/package.tgz',
                          '--loadRecursively=false', '--includeSearchBundles=false',
                          '--spring.main.banner-mode=off', '--logging.pattern.console=%msg%n']
               generated = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -151,18 +144,20 @@ jobs:
               entries = bundle.get('entry', [])
               result['entries'] = len(entries)
               if not entries:
-                  raise RuntimeError('Ember produced no resources; UploadFIG will not run')
+                  result['status'] = 'skipped'
+                  record('No examples found in package/example; proceeding to UploadFIG attempt 3.')
               else:
-                  # Validate stable IDs for every PUT; keep fullUrl for cross-references.
+                  # 0.3.0 generates POST entries. Use stable IDs to avoid creating duplicates
+                  # of examples already loaded by UploadFIG; keep fullUrl for cross-references.
                   identities = set()
                   for entry in entries:
                       resource = entry.get('resource', {})
                       kind, rid = resource.get('resourceType', ''), resource.get('id', '')
                       if not re.fullmatch(r'[A-Z][A-Za-z0-9]+', kind) or not re.fullmatch(r'[A-Za-z0-9.-]{1,64}', rid):
-                          raise RuntimeError('Resource has no valid resource type/ID; transaction was not sent')
+                          raise RuntimeError('Example has no valid resource type/ID; transaction was not sent')
                       identity = f'{kind}/{rid}'
                       if identity in identities:
-                          raise RuntimeError(f'Duplicate resource identity {identity}; transaction was not sent')
+                          raise RuntimeError(f'Duplicate example identity {identity}; transaction was not sent')
                       identities.add(identity)
                       entry['request'] = dict(method='PUT', url=identity)
                   # Save generated content after redaction; use original content for the request.
@@ -186,7 +181,7 @@ jobs:
                       if not re.match(r'^2\d\d(?:\s|$)', status):
                           raise RuntimeError('Transaction contains an unsuccessful entry response')
                   result['status'] = 'success'
-                  record('Ember preload succeeded; proceeding to UploadFIG.')
+                  record('Ember transaction succeeded; proceeding to UploadFIG attempt 3.')
           except urllib.error.HTTPError as error:
               record(f'ERROR: Ember transaction HTTP {error.code}')
               record(error.read().decode('utf-8', errors='replace'))
@@ -194,24 +189,14 @@ jobs:
               record('ERROR: ' + str(error))
           finally:
               (folder / 'ember-results.json').write_text(json.dumps(result, indent=2) + '\n')
-              print('Ember preload: ' + result['status'] + '; see ember.log.')
-          sys.exit(0 if result['status'] == 'success' else 1)
+              print('Ember fallback: ' + result['status'] + '; see ember.log. Continuing with UploadFIG attempt 3.')
           EMBER_PYTHON
-      - name: Upload IG package (profiles, extensions, terminology and examples)
-        id: uploadfig
-        if: env.FHIR_SERVER_URL != ''
-        env:
-          # Keep the token out of build/setup steps. Never enable shell tracing.
-          FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p workflow-logs
-          args=(-s output/package.tgz -d "$FHIR_SERVER_URL" -df json -r '*')
-          if [ -n "$FHIR_SERVER_TOKEN" ]; then
-            args+=(-dh "Authorization: Bearer $FHIR_SERVER_TOKEN")
-          fi
-          # Earlier attempts must not mark the job failed if a later one succeeds.
-          for attempt in 1 2 3; do
+              then
+                :
+              else
+                echo "Ember fallback could not complete; continuing with UploadFIG attempt 3."
+              fi
+            fi
             echo "UploadFIG attempt $attempt/3"
             log="workflow-logs/uploadfig-attempt-${attempt}.log"
             # Redact before tee: GitHub does not sanitize artifact files.
@@ -359,7 +344,6 @@ jobs:
       - name: Write workflow summary
         if: ${{ always() }}
         env:
-          EMBER_OUTCOME: ${{ steps.ember.outcome }}
           JOB_STATUS: ${{ job.status }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           DOTNET_OUTCOME: ${{ steps.dotnet.outcome }}
@@ -403,8 +387,7 @@ jobs:
                    "Explicit ERROR lines observed: " + str(data.get("explicit_error_lines", "N/A")),
                    "", "| Step | Outcome |", "| --- | --- |"]
           for name, key in (("Build", "BUILD_OUTCOME"), (".NET setup", "DOTNET_OUTCOME"),
-                            ("Install UploadFIG", "INSTALL_OUTCOME"), ("Ember preload", "EMBER_OUTCOME"),
-                            ("UploadFIG", "UPLOAD_OUTCOME"),
+                            ("Install UploadFIG", "INSTALL_OUTCOME"), ("UploadFIG", "UPLOAD_OUTCOME"),
                             ("Result checks", "RESULTS_OUTCOME"), ("IG artifact", "IG_ARTIFACT_OUTCOME"),
                             ("Log artifact", "LOG_ARTIFACT_OUTCOME")):
               rows.append(f"| {name} | {os.environ.get(key) or 'skipped'} |")
@@ -418,10 +401,10 @@ jobs:
               rows += ["", "A zero exit code alone does not imply success: reported errors and "
                        "missing final totals also trigger another attempt."]
           ember = data.get("ember", {"status": "not_run", "entries": 0})
-          rows += ["", "### Ember preload (before UploadFIG)", "",
-                   "Status: " + ember["status"] + "; resource entries: " + str(ember["entries"]) + ".",
-                   "Ember includes package/ and package/example and submits a transaction with stable IDs (PUT).",
-                   "A failed or empty preload blocks UploadFIG. See ember.log when executed.",
+          rows += ["", "### Ember fallback (between attempts 2 and 3)", "",
+                   "Status: " + ember["status"] + "; example entries: " + str(ember["entries"]) + ".",
+                   "Ember reads package/example and submits a transaction with stable IDs (PUT).",
+                   "If no examples are present there, Ember skips submission. See ember.log when executed.",
                    "The final upload status and counts remain those of the last UploadFIG attempt."]
           rows += ["", "### UploadFIG error details (last attempt)", ""]
           details = data.get("error_details", [])
