@@ -1,6 +1,6 @@
 name: Build IG and upload resources to FHIR server
 
-on:
+'on':
   workflow_call:
     inputs:
       fhir-server-url:
@@ -39,8 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FHIR_SERVER_URL: ${{ inputs.fhir-server-url }}
-      FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
       TX_SERVER: ${{ inputs.tx-server }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -57,26 +59,166 @@ jobs:
       - name: Download IG Publisher
         run: |
           mkdir -p input-cache
-          curl -L https://github.com/HL7/fhir-ig-publisher/releases/latest/download/publisher.jar -o input-cache/publisher.jar
+          curl --fail --show-error --location https://github.com/HL7/fhir-ig-publisher/releases/latest/download/publisher.jar -o input-cache/publisher.jar
       - name: Build IG
-        run: ./_genonce.sh
-      - name: Upload IG output and QA report as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.artifact-name }}
-          path: output
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p workflow-logs
+          ./_genonce.sh 2>&1 | tee workflow-logs/build.log
       - uses: actions/setup-dotnet@v4
+        id: dotnet
         if: env.FHIR_SERVER_URL != ''
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
       - name: Install UploadFIG
+        id: install_uploadfig
         if: env.FHIR_SERVER_URL != ''
         run: dotnet tool install -g UploadFIG
       - name: Upload IG package (profiles, extensions, terminology and examples)
+        id: uploadfig
         if: env.FHIR_SERVER_URL != ''
+        env:
+          # Keep the token out of build/setup steps. Never enable shell tracing.
+          FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
         run: |
+          set -euo pipefail
+          mkdir -p workflow-logs
           args=(-s output/package.tgz -d "$FHIR_SERVER_URL" -df json -r '*')
           if [ -n "$FHIR_SERVER_TOKEN" ]; then
             args+=(-dh "Authorization: Bearer $FHIR_SERVER_TOKEN")
           fi
-          ~/.dotnet/tools/UploadFIG "${args[@]}"
+          # GitHub masks console secrets, but does NOT sanitize artifact files.
+          # Redact before tee so neither the console nor the saved log gets the token.
+          ~/.dotnet/tools/UploadFIG "${args[@]}" 2>&1 |
+            python3 -u -c '
+          import os, re, sys
+          token = os.environ.get("FHIR_SERVER_TOKEN", "")
+          for line in sys.stdin:
+              if token:
+                  line = line.replace(token, "[REDACTED]")
+              line = re.sub(r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"\x27]+", r"\1[REDACTED]", line)
+              sys.stdout.write(line)
+          ' | tee workflow-logs/uploadfig.log
+
+      - name: Parse UploadFIG results and check reported failures
+        id: results
+        if: ${{ always() }}
+        env:
+          UPLOAD_OUTCOME: ${{ steps.uploadfig.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p workflow-logs
+          python3 - <<'PYTHON'
+          import json, os, re
+          from pathlib import Path
+
+          folder = Path("workflow-logs")
+          path = folder / "uploadfig.log"
+          outcome = os.environ["UPLOAD_OUTCOME"]
+          ran = outcome in ("success", "failure", "cancelled")
+          exists = path.is_file()
+          text = path.read_text(errors="replace") if exists else ""
+          text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "\n")
+          lines = text.splitlines()
+          counts = {key: None for key in ("created", "updated", "unchanged", "errors")}
+          complete = False
+          error_lines = 0
+          if ran and exists:
+              for key in ("created", "updated", "unchanged"):
+                  # UploadFIG emits action-first lines, plus Resource/id unchanged.
+                  pattern = rf"^\s*(?:{key}\s+\S+" + (
+                      r"|[A-Z][A-Za-z0-9]*/\S+\s+unchanged(?:\s|$)" if key == "unchanged" else ""
+                  ) + ")"
+                  counts[key] = sum(bool(re.search(pattern, line)) for line in lines)
+              def last_total(label):
+                  matches = re.findall(rf"^\s*{label}:\s*(\d+)\s*$", text, re.M)
+                  return int(matches[-1]) if matches else None
+              failures = last_total("Failures")
+              validation = last_total("Validation Errors")
+              complete = all(last_total(label) is not None for label in
+                             ("Success", "Failures", "Validation Errors",))
+              error_lines = sum(bool(re.match(r"^\s*ERROR\s*:", line, re.I)) for line in lines)
+              # Do not add ERROR lines to totals: they may describe the same failures.
+              if failures is not None and validation is not None:
+                  counts["errors"] = failures + validation
+          data = dict(counts=counts, complete=complete, outcome=outcome,
+                      explicit_error_lines=error_lines, log_present=exists)
+          (folder / "uploadfig-results.json").write_text(json.dumps(data, indent=2) + "\n")
+          if not exists:
+              path.write_text("UploadFIG was not executed or produced no captured log.\n")
+          # Some UploadFIG versions report errors while returning exit code zero.
+          if ran and (not complete or (counts["errors"] or 0) > 0 or error_lines > 0):
+              print("::error::UploadFIG reported errors or its final summary is incomplete; inspect the log artifact.")
+              raise SystemExit(1)
+          PYTHON
+
+      - name: Upload IG output and QA report as artifact
+        id: ig_artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: output
+          if-no-files-found: warn
+
+      - name: Upload diagnostic logs (including on failure)
+        id: log_artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}-logs
+          path: workflow-logs/
+          if-no-files-found: warn
+
+      - name: Write workflow summary
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          DOTNET_OUTCOME: ${{ steps.dotnet.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install_uploadfig.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.uploadfig.outcome }}
+          RESULTS_OUTCOME: ${{ steps.results.outcome }}
+          IG_ARTIFACT_OUTCOME: ${{ steps.ig_artifact.outcome }}
+          LOG_ARTIFACT_OUTCOME: ${{ steps.log_artifact.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+
+          path = Path("workflow-logs/uploadfig-results.json")
+          data = json.loads(path.read_text()) if path.is_file() else {}
+          outcome = os.environ["UPLOAD_OUTCOME"] or "skipped"
+          counts = data.get("counts", {})
+          complete = data.get("complete", False)
+          if outcome == "skipped":
+              reason = ("FHIR server URL is empty." if not os.environ.get("FHIR_SERVER_URL")
+                        else "A preceding step failed, was cancelled or was skipped.")
+              upload_status = "Skipped — " + reason
+          elif outcome == "success" and os.environ["RESULTS_OUTCOME"] == "success":
+              upload_status = "Success"
+          else:
+              upload_status = "Failure / cancelled — see step outcomes and logs."
+          rows = ["## IG build and FHIR upload", "",
+                  "**Job status:** " + os.environ["JOB_STATUS"],
+                  "**UploadFIG:** " + upload_status, "",
+                  "| Metric | Count |", "| --- | ---: |"]
+          for key in ("created", "updated", "unchanged", "errors"):
+              value = counts.get(key)
+              rows.append(f"| {key} | {value if value is not None else 'N/A'} |")
+          rows += ["", "Created/updated/unchanged count resource operation lines in the captured log.",
+                   "Errors = final Failures + Validation Errors; ERROR lines are not added again.",
+                   "Final UploadFIG totals present: " + ("yes" if complete else "no") + ".",
+                   "If totals are absent, counts are partial observations; N/A means unavailable, not zero.",
+                   "Explicit ERROR lines observed: " + str(data.get("explicit_error_lines", "N/A")),
+                   "", "| Step | Outcome |", "| --- | --- |"]
+          for name, key in (("Build", "BUILD_OUTCOME"), (".NET setup", "DOTNET_OUTCOME"),
+                            ("Install UploadFIG", "INSTALL_OUTCOME"), ("UploadFIG", "UPLOAD_OUTCOME"),
+                            ("Result checks", "RESULTS_OUTCOME"), ("IG artifact", "IG_ARTIFACT_OUTCOME"),
+                            ("Log artifact", "LOG_ARTIFACT_OUTCOME")):
+              rows.append(f"| {name} | {os.environ.get(key) or 'skipped'} |")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(rows) + "\n")
+          PYTHON
