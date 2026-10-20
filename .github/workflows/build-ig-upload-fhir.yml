@@ -77,6 +77,6 @@ jobs:
         run: |
           args=(-s output/package.tgz -d "$FHIR_SERVER_URL" -df json -r '*')
           if [ -n "$FHIR_SERVER_TOKEN" ]; then
-            args+=(-dh "Authorization: ******")
+            args+=(-dh "Authorization: Bearer $FHIR_SERVER_TOKEN")
           fi
           ~/.dotnet/tools/UploadFIG "${args[@]}"
