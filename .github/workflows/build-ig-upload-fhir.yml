@@ -88,10 +88,121 @@ jobs:
           if [ -n "$FHIR_SERVER_TOKEN" ]; then
             args+=(-dh "Authorization: Bearer $FHIR_SERVER_TOKEN")
           fi
-          # GitHub masks console secrets, but does NOT sanitize artifact files.
-          # Redact before tee so neither the console nor the saved log gets the token.
-          ~/.dotnet/tools/UploadFIG "${args[@]}" 2>&1 |
-            python3 -u -c '
+          # Earlier attempts must not mark the job failed if a later one succeeds.
+          for attempt in 1 2 3; do
+            # Run the example transaction only after the first two passes failed.
+            if [ "$attempt" -eq 3 ]; then
+              echo "Running Ember fallback before UploadFIG attempt 3."
+              if python3 - <<'EMBER_PYTHON'
+          import json, os, re, subprocess, urllib.error, urllib.request
+          from pathlib import Path
+          
+          folder = Path('workflow-logs')
+          log = folder / 'ember.log'
+          result = dict(status='failure', entries=0)
+          token = os.environ.get('FHIR_SERVER_TOKEN', '')
+          def redact(value):
+              if token:
+                  value = value.replace(token, '[REDACTED]')
+              return re.sub(r'(?i)(authorization\s*:\s*bearer\s+)\S+', r'\1[REDACTED]', value)
+          def record(message):
+              with log.open('a') as stream:
+                  stream.write(redact(str(message)) + '\n')
+          
+          # No redirect may forward the bearer token to another endpoint.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          try:
+              # Ember 0.3.0 reads package/example; it does not recursively load dependencies.
+              # Without serverBase it only generates a bundle and never contacts our FHIR server.
+              package = Path('output/package.tgz').resolve()
+              command = ['docker', 'run', '--rm', '--name', 'ig-ember-fallback',
+                         '--mount', f'type=bind,src={package},dst=/input/package.tgz,readonly',
+                         'jkiddo/ember:0.3.0', '--location=file:/input/package.tgz',
+                         '--loadRecursively=false', '--includeSearchBundles=false',
+                         '--spring.main.banner-mode=off', '--logging.pattern.console=%msg%n']
+              generated = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, timeout=300)
+              record(generated.stdout)
+              if generated.returncode:
+                  raise RuntimeError(f'Ember generation exited with code {generated.returncode}')
+              # Extract only a complete transaction Bundle from the mixed console output.
+              decoder = json.JSONDecoder()
+              bundles = []
+              for match in re.finditer(r'^\s*\{', generated.stdout, re.M):
+                  try:
+                      candidate, _ = decoder.raw_decode(generated.stdout, match.end() - 1)
+                  except ValueError:
+                      continue
+                  if isinstance(candidate, dict) and candidate.get('resourceType') == 'Bundle' and candidate.get('type') == 'transaction':
+                      bundles.append(candidate)
+              if len(bundles) != 1:
+                  raise RuntimeError('Expected exactly one Ember transaction Bundle')
+              bundle = bundles[0]
+              entries = bundle.get('entry', [])
+              result['entries'] = len(entries)
+              if not entries:
+                  result['status'] = 'skipped'
+                  record('No examples found in package/example; proceeding to UploadFIG attempt 3.')
+              else:
+                  # 0.3.0 generates POST entries. Use stable IDs to avoid creating duplicates
+                  # of examples already loaded by UploadFIG; keep fullUrl for cross-references.
+                  identities = set()
+                  for entry in entries:
+                      resource = entry.get('resource', {})
+                      kind, rid = resource.get('resourceType', ''), resource.get('id', '')
+                      if not re.fullmatch(r'[A-Z][A-Za-z0-9]+', kind) or not re.fullmatch(r'[A-Za-z0-9.-]{1,64}', rid):
+                          raise RuntimeError('Example has no valid resource type/ID; transaction was not sent')
+                      identity = f'{kind}/{rid}'
+                      if identity in identities:
+                          raise RuntimeError(f'Duplicate example identity {identity}; transaction was not sent')
+                      identities.add(identity)
+                      entry['request'] = dict(method='PUT', url=identity)
+                  # Save generated content after redaction; use original content for the request.
+                  record('Sending transaction with ' + str(len(entries)) + ' PUT entries.')
+                  headers = {'Content-Type': 'application/fhir+json', 'Accept': 'application/fhir+json'}
+                  if token:
+                      headers['Authorization'] = 'Bearer ' + token
+                  request = urllib.request.Request(os.environ['FHIR_SERVER_URL'].rstrip('/'),
+                              data=json.dumps(bundle).encode(), headers=headers, method='POST')
+                  with urllib.request.build_opener(NoRedirect).open(request, timeout=120) as response:
+                      body = response.read().decode('utf-8', errors='replace')
+                      record(body)
+                      payload = json.loads(body)
+                  if payload.get('resourceType') != 'Bundle' or payload.get('type') != 'transaction-response':
+                      raise RuntimeError('Server did not return a transaction-response Bundle')
+                  responses = payload.get('entry', [])
+                  if len(responses) != len(entries):
+                      raise RuntimeError('Transaction response entry count does not match request')
+                  for entry in responses:
+                      status = entry.get('response', {}).get('status', '')
+                      if not re.match(r'^2\d\d(?:\s|$)', status):
+                          raise RuntimeError('Transaction contains an unsuccessful entry response')
+                  result['status'] = 'success'
+                  record('Ember transaction succeeded; proceeding to UploadFIG attempt 3.')
+          except urllib.error.HTTPError as error:
+              record(f'ERROR: Ember transaction HTTP {error.code}')
+              record(error.read().decode('utf-8', errors='replace'))
+          except Exception as error:
+              record('ERROR: ' + str(error))
+          finally:
+              (folder / 'ember-results.json').write_text(json.dumps(result, indent=2) + '\n')
+              print('Ember fallback: ' + result['status'] + '; see ember.log. Continuing with UploadFIG attempt 3.')
+          EMBER_PYTHON
+              then
+                :
+              else
+                echo "Ember fallback could not complete; continuing with UploadFIG attempt 3."
+              fi
+            fi
+            echo "UploadFIG attempt $attempt/3"
+            log="workflow-logs/uploadfig-attempt-${attempt}.log"
+            # Redact before tee: GitHub does not sanitize artifact files.
+            # The conditional captures the pipeline status without disabling pipefail.
+            if ~/.dotnet/tools/UploadFIG "${args[@]}" 2>&1 |
+              python3 -u -c '
           import os, re, sys
           token = os.environ.get("FHIR_SERVER_TOKEN", "")
           for line in sys.stdin:
@@ -99,7 +210,38 @@ jobs:
                   line = line.replace(token, "[REDACTED]")
               line = re.sub(r"(?i)(authorization\s*:\s*bearer\s+)[^\s\"\x27]+", r"\1[REDACTED]", line)
               sys.stdout.write(line)
-          ' | tee workflow-logs/uploadfig.log
+          ' | tee "$log"; then
+              pipeline_exit=0
+            else
+              pipeline_exit=$?
+            fi
+            # Keep an alias of ONLY the latest attempt for the final parser/dashboard.
+            cp "$log" workflow-logs/uploadfig.log
+            printf '%s\t%s\n' "$attempt" "$pipeline_exit" >> workflow-logs/uploadfig-attempts.tsv
+            if python3 - "$log" "$pipeline_exit" <<'PYTHON'
+          import re, sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(errors="replace")
+          text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "\n")
+          def last_total(label):
+              values = re.findall(rf"^\s*{label}:\s*(\d+)\s*$", text, re.M)
+              return int(values[-1]) if values else None
+          totals = [last_total(label) for label in ("Success", "Failures", "Validation Errors")]
+          diagnostic = re.search(
+              r"^\s*(?:ERROR\b(?!S)(?:\s*:|\s+)|FATAL\s*:|Unhandled exception\b)",
+              text, re.I | re.M)
+          passed = (int(sys.argv[2]) == 0 and all(value is not None for value in totals)
+                    and totals[1] == 0 and totals[2] == 0 and not diagnostic)
+          raise SystemExit(0 if passed else 1)
+          PYTHON
+            then
+              echo "UploadFIG completed without errors on attempt $attempt."
+              exit 0
+            fi
+          done
+          echo "UploadFIG still has errors after 3 attempts; see the final attempt log."
+          exit 1
 
       - name: Parse UploadFIG results and check reported failures
         id: results
@@ -161,14 +303,22 @@ jobs:
           # Bound the dashboard and JSON size; the full redacted log is the artifact.
           detail_total = len(details)
           details = details[:20]
-          data = dict(counts=counts, complete=complete, outcome=outcome,
+          attempts_path = folder / "uploadfig-attempts.tsv"
+          attempts = []
+          if attempts_path.is_file():
+              for entry in attempts_path.read_text().splitlines():
+                  number, code = entry.split("\t")
+                  attempts.append(dict(attempt=int(number), pipeline_exit=int(code)))
+          ember_path = folder / "ember-results.json"
+          ember = json.loads(ember_path.read_text()) if ember_path.is_file() else dict(status="not_run", entries=0)
+          data = dict(ember=ember, attempts=attempts, counts=counts, complete=complete, outcome=outcome,
                       explicit_error_lines=error_lines, log_present=exists,
                       error_details=details, unique_error_messages=detail_total)
           (folder / "uploadfig-results.json").write_text(json.dumps(data, indent=2) + "\n")
           if not exists:
               path.write_text("UploadFIG was not executed or produced no captured log.\n")
           # Some UploadFIG versions report errors while returning exit code zero.
-          if ran and (not complete or (counts["errors"] or 0) > 0 or error_lines > 0):
+          if ran and (not complete or (counts["errors"] or 0) > 0 or error_lines > 0 or detail_total > 0):
               print("::error::UploadFIG reported errors or its final summary is incomplete; inspect the log artifact.")
               raise SystemExit(1)
           PYTHON
@@ -223,7 +373,9 @@ jobs:
               upload_status = "Failure / cancelled — see step outcomes and logs."
           rows = ["## IG build and FHIR upload", "",
                   "**Job status:** " + os.environ["JOB_STATUS"],
-                  "**UploadFIG:** " + upload_status, "",
+                  "**UploadFIG:** " + upload_status,
+                  "**Attempts executed:** " + str(len(data.get("attempts", []))) + " / 3",
+                  "Counts and error details below refer only to the last executed attempt.", "",
                   "| Metric | Count |", "| --- | ---: |"]
           for key in ("created", "updated", "unchanged", "errors"):
               value = counts.get(key)
@@ -239,7 +391,22 @@ jobs:
                             ("Result checks", "RESULTS_OUTCOME"), ("IG artifact", "IG_ARTIFACT_OUTCOME"),
                             ("Log artifact", "LOG_ARTIFACT_OUTCOME")):
               rows.append(f"| {name} | {os.environ.get(key) or 'skipped'} |")
-          rows += ["", "### UploadFIG error details", ""]
+          attempts = data.get("attempts", [])
+          if attempts:
+              rows += ["", "### Upload attempts", "",
+                       "| Attempt | Pipeline exit code | Log |", "| --- | ---: | --- |"]
+              for item in attempts:
+                  rows.append(f"| {item['attempt']} | {item['pipeline_exit']} | "
+                              f"uploadfig-attempt-{item['attempt']}.log |")
+              rows += ["", "A zero exit code alone does not imply success: reported errors and "
+                       "missing final totals also trigger another attempt."]
+          ember = data.get("ember", {"status": "not_run", "entries": 0})
+          rows += ["", "### Ember fallback (between attempts 2 and 3)", "",
+                   "Status: " + ember["status"] + "; example entries: " + str(ember["entries"]) + ".",
+                   "Ember reads package/example and submits a transaction with stable IDs (PUT).",
+                   "If no examples are present there, Ember skips submission. See ember.log when executed.",
+                   "The final upload status and counts remain those of the last UploadFIG attempt."]
+          rows += ["", "### UploadFIG error details (last attempt)", ""]
           details = data.get("error_details", [])
           if details:
               rows.append("Messages extracted from uploadfig.log (line numbers refer to that artifact).")
