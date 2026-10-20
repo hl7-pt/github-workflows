@@ -1,0 +1,82 @@
+name: Build IG and upload resources to FHIR server
+
+on:
+  workflow_call:
+    inputs:
+      fhir-server-url:
+        description: FHIR server base URL (e.g. https://hapi.example.org/fhir). Upload is skipped if empty.
+        type: string
+        required: false
+        default: ''
+      tx-server:
+        description: Terminology server URL
+        type: string
+        required: false
+        default: ''
+      java-version:
+        type: string
+        required: false
+        default: '17'
+      node-version:
+        type: string
+        required: false
+        default: '20'
+      dotnet-version:
+        type: string
+        required: false
+        default: '8.0.x'
+      artifact-name:
+        type: string
+        required: false
+        default: ig-output
+    secrets:
+      FHIR_SERVER_TOKEN:
+        description: Optional bearer token for the FHIR server
+        required: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    env:
+      FHIR_SERVER_URL: ${{ inputs.fhir-server-url }}
+      FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
+      TX_SERVER: ${{ inputs.tx-server }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npm install -g fsh-sushi
+      - run: |
+          sudo apt-get update && sudo apt-get install -y ruby-full build-essential jq
+          sudo gem install jekyll
+      - name: Download IG Publisher
+        run: |
+          mkdir -p input-cache
+          curl -L https://github.com/HL7/fhir-ig-publisher/releases/latest/download/publisher.jar -o input-cache/publisher.jar
+      - name: Build IG
+        run: ./_genonce.sh
+      - name: Upload IG output and QA report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: output
+      - uses: actions/setup-dotnet@v4
+        if: env.FHIR_SERVER_URL != ''
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+      - name: Install UploadFIG
+        if: env.FHIR_SERVER_URL != ''
+        run: dotnet tool install -g UploadFIG
+      - name: Upload IG package (profiles, extensions, terminology and examples)
+        if: env.FHIR_SERVER_URL != ''
+        run: |
+          args=(-s output/package.tgz -d "$FHIR_SERVER_URL" -df json -r '*')
+          if [ -n "$FHIR_SERVER_TOKEN" ]; then
+            args+=(-dh "Authorization: ******")
+          fi
+          ~/.dotnet/tools/UploadFIG "${args[@]}"
