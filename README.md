@@ -1,1 +1,22 @@
 # github-workflows
+## Reusable workflows
+
+### `build-ig-upload-fhir.yml`
+
+Builds a FHIR IG and optionally uploads it to a FHIR server. Caller example:
+
+```yaml
+name: Build IG and upload
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    uses: hl7-pt/github-workflows/.github/workflows/build-ig-upload-fhir.yml@main
+    with:
+      fhir-server-url: ${{ vars.FHIR_SERVER_URL }}
+      tx-server: ${{ vars.TX_SERVER }}
+    secrets:
+      FHIR_SERVER_TOKEN: ${{ secrets.FHIR_SERVER_TOKEN }}
+```
