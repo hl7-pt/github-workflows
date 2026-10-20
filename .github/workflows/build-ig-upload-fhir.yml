@@ -142,8 +142,28 @@ jobs:
               # Do not add ERROR lines to totals: they may describe the same failures.
               if failures is not None and validation is not None:
                   counts["errors"] = failures + validation
+          # Capture diagnostic messages separately from the numeric totals.
+          # Match actual diagnostics, not the final "Validation Errors: N" total.
+          diagnostic = re.compile(
+              r"^\s*(?:ERROR\b(?!S)(?:\s*:|\s+)|FATAL\s*:|Unhandled exception\b)", re.I)
+          details = []
+          seen = {}
+          for number, line in enumerate(lines, 1):
+              if not diagnostic.search(line):
+                  continue
+              message = line.strip()
+              if message in seen:
+                  seen[message]["occurrences"] += 1
+                  continue
+              item = dict(line=number, message=message[:2000], occurrences=1)
+              seen[message] = item
+              details.append(item)
+          # Bound the dashboard and JSON size; the full redacted log is the artifact.
+          detail_total = len(details)
+          details = details[:20]
           data = dict(counts=counts, complete=complete, outcome=outcome,
-                      explicit_error_lines=error_lines, log_present=exists)
+                      explicit_error_lines=error_lines, log_present=exists,
+                      error_details=details, unique_error_messages=detail_total)
           (folder / "uploadfig-results.json").write_text(json.dumps(data, indent=2) + "\n")
           if not exists:
               path.write_text("UploadFIG was not executed or produced no captured log.\n")
@@ -185,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PYTHON'
-          import json, os
+          import html, json, os
           from pathlib import Path
 
           path = Path("workflow-logs/uploadfig-results.json")
@@ -219,6 +239,33 @@ jobs:
                             ("Result checks", "RESULTS_OUTCOME"), ("IG artifact", "IG_ARTIFACT_OUTCOME"),
                             ("Log artifact", "LOG_ARTIFACT_OUTCOME")):
               rows.append(f"| {name} | {os.environ.get(key) or 'skipped'} |")
+          rows += ["", "### UploadFIG error details", ""]
+          details = data.get("error_details", [])
+          if details:
+              rows.append("Messages extracted from uploadfig.log (line numbers refer to that artifact).")
+              for index, item in enumerate(details, 1):
+                  # Treat log text as untrusted: prevent HTML/Markdown injection.
+                  message = html.escape(item["message"])
+                  rows += ["", "<details>",
+                           f"<summary>Error {index} — log line {item['line']} "
+                           f"({item['occurrences']} occurrence(s))</summary>", "",
+                           "<pre>" + message + "</pre>", "", "</details>"]
+              total = data.get("unique_error_messages", len(details))
+              if total > len(details):
+                  rows += ["", f"Showing the first {len(details)} of {total} distinct error messages; "
+                                   f"{total - len(details)} omitted. See the log artifact for the full list."]
+              rows += ["", "Messages are limited to 2000 characters each; see the log artifact for full context."]
+          elif outcome == "skipped":
+              rows.append("No upload errors to list: UploadFIG was not executed.")
+          elif not data.get("log_present"):
+              rows.append("Error details unavailable: no captured UploadFIG log.")
+          elif not complete or (counts.get("errors") or 0) > 0 or outcome != "success":
+              rows.append("No recognized error messages found. The upload failed, was cancelled, or "
+                          "has incomplete totals; inspect the full log artifact for details.")
+          else:
+              rows.append("No recognized error messages found in the captured log.")
+          if os.environ.get("BUILD_OUTCOME") == "failure":
+              rows += ["", "The IG build failed; inspect build.log in the log artifact."]
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
               summary.write("\n".join(rows) + "\n")
           PYTHON
